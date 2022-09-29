@@ -17,14 +17,14 @@ def rhs(x):
 
 geo = dde.geometry.Disk([0,0], 1)
 
-net_u = model.FEMFNN(2, 1, input_sup=input_sup, input_inf=input_inf, num_nodes=[20]*4, activation=torch.nn.ReLU())
-net_phi = model.FEMFNN(2, 1, input_sup=input_sup, input_inf=input_inf, num_nodes=[20]*4, activation=torch.nn.SiLU())
-gan = model.FEMGAN(net_u=net_u, net_phi=net_phi, geometry=geo, size=1000, rhs=rhs)
+net_u = model.FEMFNN(2, 1, input_sup=input_sup, input_inf=input_inf, num_nodes=[20]*4)
+net_phi = model.FEMFNN(2, 1, input_sup=input_sup, input_inf=input_inf, num_nodes=[20]*4)
+gan = model.FEMGAN(net_u=net_u, net_phi=net_phi, geometry=geo, size=2000, rhs=rhs)
 
 optimizer_u = torch.optim.Adam(params=net_u.parameters(), lr=1e-4)
-optimizer_phi = torch.optim.Adam(params=net_phi.parameters(), lr=1e-2)
+optimizer_phi = torch.optim.Adam(params=net_phi.parameters(), lr=1e-3)
 
-gan.train(optimizer_u, optimizer_phi, 10)
+gan.train(optimizer_u, optimizer_phi, 200)
 
 x = geo.random_points(10)
 y = gan.evaluate(x).detach().numpy()
@@ -34,5 +34,5 @@ y = gan.evaluate(x).detach().numpy()
 # print(net_u.coefficient)
 
 res = x[:,0] ** 2 + x[:,1] ** 2 - y
-res = np.abs(res)
-print(res.max())
+# res = np.abs(res)
+print(res)

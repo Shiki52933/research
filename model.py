@@ -1,4 +1,5 @@
 import torch
+import deepxde as dde
 import numpy as np
 
 
@@ -29,13 +30,8 @@ class FEMFNN(torch.nn.Module):
 
         self.to(device)
 
-    def _normalize(self, x, input_sup, input_inf):
-        x = (x - input_inf) / (input_sup - input_inf)
-        x = 2 * x - 1
-        return x
-
     def forward(self, x):
-        x = self._normalize(x, self.input_sup, self.input_inf)
+        # x = self._normalize(x, self.input_sup, self.input_inf)
 
         for net in self.nets:
             x = net(x)
@@ -45,12 +41,18 @@ class FEMFNN(torch.nn.Module):
 
 
 class FEMGAN:
-    def __init__(self, net_u: FEMFNN, net_phi: FEMFNN, geometry, size: int, rhs) -> None:
+    def __init__(self, net_u: FEMFNN, net_phi: FEMFNN, geometry: dde.geometry, size: int, rhs) -> None:
         self.net_u = net_u
         self.net_phi = net_phi
         self.geometry = geometry
         self.rhs = rhs
         self.size = size
+        self.boundary_size = 1000
+        self.volumn = self.geometry._r2 * np.pi
+        self.surface_volumn = 2 * np.pi * self.geometry.radius
+
+    def pre_train(self):
+        pass
 
     def cal_loss(self):
         # TODO: non-zero boundary conditions
@@ -59,9 +61,15 @@ class FEMGAN:
 
         value_rhs = self.rhs(points)
         value_phi = self.net_phi(points)
-        rhs = torch.mean(value_rhs * value_phi, dim=0).squeeze()
+        rhs = self.volumn * torch.mean(value_rhs * value_phi, dim=0).squeeze()
         # print(rhs.max())
 
+        # 计算边界上的值
+        boundary_points = self.geometry.random_boundary_points(self.boundary_size)
+        boundary_normal = self.geometry.boundary_normal(boundary_points)
+        boundary_points = torch.tensor(boundary_points, requires_grad=True, dtype=torch.float32, device=self.net_u.device)
+        boundary_normal = torch.tensor(boundary_normal, requires_grad=True, dtype=torch.float32, device=self.net_u.device)
+        
         f_s = self.net_u(points)
 
         gradient_phi = []
@@ -86,27 +94,60 @@ class FEMGAN:
             )[0]
             gradient_f_s.append(grad_f_i)
 
-        A = torch.empty([rhs.shape[0], f_s.size()[-1]], dtype=torch.float32, device=self.net_u.device)
 
-        for i in range(A.shape[0]):
+        bdy_f_s = self.net_u(boundary_points)
+        bdy_phi = self.net_phi(boundary_points)
+
+        gradient_bdy_f_s = []
+        for i in range(bdy_f_s.size()[-1]):
+            grad_bdy_f_i = torch.autograd.grad(
+                bdy_f_s[..., i:i + 1],
+                boundary_points,
+                create_graph=True,
+                retain_graph=True,
+                grad_outputs=torch.ones_like(bdy_f_s[..., i:i + 1])
+            )[0]
+            gradient_bdy_f_s.append((grad_bdy_f_i * boundary_normal).sum(dim=-1))
+
+
+        A = torch.empty([2 * rhs.shape[0], f_s.size()[-1]], dtype=torch.float32, device=self.net_u.device)
+
+        for i in range(A.shape[0]//2):
             for j in range(A.shape[1]):
-                A[i, j] = torch.mean( (gradient_phi[i] * gradient_f_s[j]).sum(dim=-1) )
+                A[i,j] = self.volumn * torch.mean( (gradient_phi[i] * gradient_f_s[j]).sum(dim=-1) )
+                A[i,j] -= torch.mean(bdy_phi[..., i:i+1] * gradient_bdy_f_s[j]) * self.surface_volumn
                 # print(A[i, j])
+            
+        for i in range(A.shape[0]//2):
+            for j in range(A.shape[1]):
+                A[i+A.shape[0]//2,j] = torch.mean(
+                    bdy_f_s[..., j:j+1] * bdy_phi[..., i:i+1]
+                    ) * self.surface_volumn
+                # print(bdy_f_s[..., j:j+1])
+                # print(bdy_phi[..., i:i+1])
+                # print(A[i,j])
+        
+        bdy_rhs = torch.zeros_like(rhs)
+        for i in range(bdy_rhs.size()[-1]):
+            bdy_rhs[i] = torch.mean(bdy_phi[..., i:i+1]) * self.surface_volumn
+        
+        all_rhs = torch.concat([rhs, bdy_rhs])
 
         np_A = A.detach().to('cpu').numpy()
-        np_rhs = rhs.detach().to('cpu').numpy()
+        np_rhs = all_rhs.detach().to('cpu').numpy().reshape([-1,1])
 
         # print(np_A)
         # print(np_rhs)
 
-        coef = np.linalg.pinv(np_A).dot(np_rhs)
+        coef = np.linalg.inv(np_A.T.dot(np_A)).dot(np_A.T).dot(np_rhs)
+        # coef = np.linalg.pinv(np_A).dot(np_rhs)
         # print(coef)
 
         coef = torch.tensor(coef, dtype=torch.float32, device=self.net_u.device)
         self.net_u.coefficient = coef.reshape([1,-1])
 
-        loss = torch.mean(A @ coef - rhs) ** 2
-
+        loss = torch.mean((A @ coef - rhs) ** 2)
+        
         return loss
 
     def train(self, optimizer_u, optimizer_phi, epochs=100):
